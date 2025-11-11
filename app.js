@@ -2,6 +2,12 @@ const OPENAI_ENDPOINT = 'https://api.openai.com/v1/responses';
 const OPENAI_MODEL = 'gpt-4.1-mini';
 const MAX_DOCUMENT_CHARS = 15000;
 
+const PDF_JS_VERSION = '4.2.67';
+
+if (window.pdfjsLib?.GlobalWorkerOptions) {
+  window.pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${PDF_JS_VERSION}/pdf.worker.min.js`;
+}
+
 const documentState = {
   name: '',
   size: 0,
@@ -670,6 +676,100 @@ function formatFileSize(bytes) {
   return `${megabytes.toFixed(1)} MB`;
 }
 
+function isProbablyPdf(file) {
+  if (!file) {
+    return false;
+  }
+  if (file.type === 'application/pdf') {
+    return true;
+  }
+  return /\.pdf$/i.test(file.name || '');
+}
+
+function normalizeDocumentText(text) {
+  if (!text) {
+    return '';
+  }
+
+  const withoutNulls = text.replace(/\u0000/g, ' ');
+  const normalizedLineBreaks = withoutNulls
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n');
+
+  const lines = normalizedLineBreaks
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line, index, arr) => line.length > 0 || (index > 0 && arr[index - 1].length > 0));
+
+  return lines.join('\n').trim();
+}
+
+async function extractTextFromPdf(file) {
+  const pdfjsLib = window.pdfjsLib;
+  if (!pdfjsLib || typeof pdfjsLib.getDocument !== 'function') {
+    throw new Error('PDF.js is not available to read PDF documents.');
+  }
+
+  const data = await file.arrayBuffer();
+  const pdf = await pdfjsLib.getDocument({ data }).promise;
+  const textChunks = [];
+  let totalLength = 0;
+
+  for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
+    const page = await pdf.getPage(pageNumber);
+    const content = await page.getTextContent();
+    const strings = content.items
+      .map((item) => (typeof item.str === 'string' ? item.str : ''))
+      .filter(Boolean);
+
+    if (!strings.length) {
+      continue;
+    }
+
+    const pageText = strings.join(' ').replace(/\s+/g, ' ').trim();
+    if (!pageText) {
+      continue;
+    }
+
+    const chunk = `${pageText}\n\n`;
+    textChunks.push(chunk);
+    totalLength += chunk.length;
+
+    if (totalLength > MAX_DOCUMENT_CHARS * 1.5) {
+      break;
+    }
+  }
+
+  const combined = textChunks.join('').trim();
+  if (!combined) {
+    throw new Error('No readable text found in the PDF.');
+  }
+
+  return combined;
+}
+
+async function readFileAsText(file) {
+  if (!file) {
+    return '';
+  }
+
+  if (isProbablyPdf(file)) {
+    return extractTextFromPdf(file);
+  }
+
+  if (typeof file.type === 'string' && file.type.startsWith('text/')) {
+    return file.text();
+  }
+
+  if (/\.(txt|md|csv|json|html?|rtf)$/i.test(file.name || '')) {
+    return file.text();
+  }
+
+  const buffer = await file.arrayBuffer();
+  const decoder = new TextDecoder('utf-8', { fatal: false });
+  return decoder.decode(buffer);
+}
+
 function updateDocumentPreview(message) {
   const preview = document.getElementById('document-preview');
   const clearButton = document.getElementById('clear-document');
@@ -740,9 +840,17 @@ async function handleDocumentUpload(event) {
   updateDocumentPreview('Reading document…');
 
   try {
-    const text = await file.text();
-    const truncated = text.length > MAX_DOCUMENT_CHARS;
-    const usableText = truncated ? text.slice(0, MAX_DOCUMENT_CHARS) : text;
+    const rawText = await readFileAsText(file);
+    const normalizedText = normalizeDocumentText(rawText);
+
+    if (!normalizedText) {
+      throw new Error('No readable text extracted from document.');
+    }
+
+    const truncated = normalizedText.length > MAX_DOCUMENT_CHARS;
+    const usableText = truncated
+      ? normalizedText.slice(0, MAX_DOCUMENT_CHARS)
+      : normalizedText;
 
     documentState.name = file.name;
     documentState.size = file.size;
@@ -753,7 +861,9 @@ async function handleDocumentUpload(event) {
   } catch (error) {
     console.error('Failed to read document', error);
     clearDocument();
-    updateDocumentPreview('Unable to read document. Please try a different file.');
+    updateDocumentPreview(
+      'Unable to extract readable text from this document. Try a PDF with selectable text or a plain-text file.'
+    );
   }
 }
 
