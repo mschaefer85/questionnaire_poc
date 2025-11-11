@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>CSDDD Questionnaire</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="styles.css" />
+    <script
+      src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.2.67/pdf.min.js"
+      crossorigin="anonymous"
+      defer
+    ></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="app-header">
+        <div class="brand">
+          <span class="brand-mark">CSDDD</span>
+          <span class="brand-title">Questionnaire Companion</span>
+        </div>
+        <div class="metrics">
+          <div class="metric">
+            <span class="metric-label">Questions answered</span>
+            <span class="metric-value" id="answered-count">0 / 0</span>
+          </div>
+          <div class="metric">
+            <span class="metric-label">Total score</span>
+            <span class="metric-value" id="score-total">0</span>
+          </div>
+        </div>
+      </header>
+      <main>
+        <section class="control-panel">
+          <div class="control-panel-header">
+            <h2>Document &amp; AI Assistant</h2>
+            <p class="control-panel-subtitle">
+              Upload your evidence document and connect your OpenAI API key to let the assistant draft answers for you.
+            </p>
+          </div>
+          <div class="control-grid">
+            <label class="control-field" for="api-key">
+              <span>OpenAI API key</span>
+              <input
+                type="password"
+                id="api-key"
+                placeholder="sk-..."
+                autocomplete="off"
+              />
+            </label>
+            <label class="control-field" for="document-upload">
+              <span>Evidence document</span>
+              <input
+                type="file"
+                id="document-upload"
+                accept=".txt,.md,.pdf,.doc,.docx,.rtf,.html,.htm,.csv,.json"
+              />
+            </label>
+          </div>
+          <div class="document-meta">
+            <div class="document-preview" id="document-preview">
+              No document uploaded yet.
+            </div>
+            <button type="button" class="ghost-button" id="clear-document" hidden>
+              Remove document
+            </button>
+          </div>
+          <p class="control-panel-hint">
+            The uploaded document never leaves your browser until you request AI assistance for a specific question.
+          </p>
+        </section>
+        <section id="questionnaire"></section>
+      </main>
+    </div>
+    <script src="app.js" defer></script>
+  </body>
+</html>
