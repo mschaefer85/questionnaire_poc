@@ -65,6 +65,7 @@ function recordOpenAiCall(entry) {
     status: entry.status || 'pending',
     httpStatus: typeof entry.httpStatus === 'number' ? entry.httpStatus : null,
     tokens: entry.tokens || null,
+    requestPreview: entry.requestPreview || '',
     responsePreview: entry.responsePreview || '',
     errorMessage: entry.errorMessage || '',
     durationMs: Number.isFinite(entry.durationMs) ? entry.durationMs : null,
@@ -109,6 +110,23 @@ function escapeHtml(value) {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
+}
+
+function createTextPreview(text, limit = 1200) {
+  if (!text) {
+    return '';
+  }
+
+  const normalized = String(text)
+    .replace(/\r\n/g, '\n')
+    .replace(/\t/g, '  ')
+    .trim();
+
+  if (normalized.length <= limit) {
+    return normalized;
+  }
+
+  return `${normalized.slice(0, limit)}…`;
 }
 
 function formatTimestamp(isoString) {
@@ -284,6 +302,9 @@ function updateAdminLog() {
         : '';
 
       const detailParts = [];
+      if (call.requestPreview) {
+        detailParts.push(`Prompt:\n${call.requestPreview}`);
+      }
       if (call.status === 'error' && call.errorMessage) {
         detailParts.push(call.errorMessage);
       }
@@ -375,6 +396,49 @@ async function performOpenAiCall({ endpoint, payload, apiKey, meta = {} }) {
   let responseData = null;
   let logged = false;
 
+  let requestPreview = '';
+  if (typeof meta.requestPreview === 'function') {
+    try {
+      requestPreview = meta.requestPreview(payload) || '';
+    } catch (previewError) {
+      console.warn('Failed to build request preview', previewError);
+      requestPreview = '';
+    }
+  } else if (typeof meta.requestPreview === 'string') {
+    requestPreview = meta.requestPreview;
+  } else if (payload && typeof payload === 'object') {
+    if (typeof payload.input === 'string') {
+      requestPreview = createTextPreview(payload.input);
+    } else if (Array.isArray(payload.messages)) {
+      const messageText = payload.messages
+        .map((message) => {
+          if (!message) {
+            return '';
+          }
+          if (typeof message.content === 'string') {
+            return message.content;
+          }
+          if (Array.isArray(message.content)) {
+            return message.content
+              .map((part) =>
+                typeof part === 'string'
+                  ? part
+                  : typeof part.text === 'string'
+                  ? part.text
+                  : typeof part.value === 'string'
+                  ? part.value
+                  : ''
+              )
+              .join(' ');
+          }
+          return '';
+        })
+        .filter(Boolean)
+        .join('\n');
+      requestPreview = createTextPreview(messageText);
+    }
+  }
+
   const baseLog = {
     id: callId,
     timestamp,
@@ -389,6 +453,7 @@ async function performOpenAiCall({ endpoint, payload, apiKey, meta = {} }) {
       ? meta.contextCount
       : 0,
     payloadSize: requestBody.length,
+    requestPreview,
   };
 
   const logCall = (fields) => {
