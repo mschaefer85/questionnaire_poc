@@ -1,6 +1,13 @@
 const OPENAI_ENDPOINT = 'https://api.openai.com/v1/responses';
 const OPENAI_MODEL = 'gpt-4.1-mini';
+const OPENAI_EMBEDDING_ENDPOINT = 'https://api.openai.com/v1/embeddings';
+const OPENAI_EMBEDDING_MODEL = 'text-embedding-3-small';
 const MAX_DOCUMENT_CHARS = 15000;
+const CHUNK_CHAR_LIMIT = 1200;
+const CHUNK_CHAR_OVERLAP = 150;
+const MAX_CONTEXT_CHUNKS = 5;
+const EMBEDDING_BATCH_SIZE = 8;
+const MIN_SIMILARITY_THRESHOLD = 0.18;
 
 const PDF_JS_VERSION = '4.2.67';
 
@@ -8,11 +15,464 @@ if (window.pdfjsLib?.GlobalWorkerOptions) {
   window.pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${PDF_JS_VERSION}/pdf.worker.min.js`;
 }
 
+const telemetryState = {
+  calls: [],
+};
+
+const viewState = {
+  active: null,
+};
+
+function generateTelemetryId() {
+  return `call-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+}
+
+function normalizeUsage(usage) {
+  if (!usage) {
+    return null;
+  }
+
+  const input =
+    usage.input_tokens ?? usage.prompt_tokens ?? usage.total_tokens ?? null;
+  const output = usage.output_tokens ?? usage.completion_tokens ?? null;
+  const total =
+    usage.total_tokens ??
+    (Number.isFinite(input) || Number.isFinite(output)
+      ? (Number.isFinite(input) ? input : 0) +
+        (Number.isFinite(output) ? output : 0)
+      : null);
+
+  return {
+    input: Number.isFinite(input) ? input : null,
+    output: Number.isFinite(output) ? output : null,
+    total: Number.isFinite(total) ? total : null,
+  };
+}
+
+function recordOpenAiCall(entry) {
+  const call = {
+    id: entry.id || generateTelemetryId(),
+    timestamp: entry.timestamp || new Date().toISOString(),
+    type: entry.type || 'openai',
+    subtype: entry.subtype || '',
+    description: entry.description || '',
+    questionNumber: entry.questionNumber || '',
+    questionText: entry.questionText || '',
+    contextCount: Number.isFinite(entry.contextCount) ? entry.contextCount : 0,
+    payloadSize: Number.isFinite(entry.payloadSize)
+      ? entry.payloadSize
+      : Number(entry.payloadSize) || 0,
+    status: entry.status || 'pending',
+    httpStatus: typeof entry.httpStatus === 'number' ? entry.httpStatus : null,
+    tokens: entry.tokens || null,
+    responsePreview: entry.responsePreview || '',
+    errorMessage: entry.errorMessage || '',
+    durationMs: Number.isFinite(entry.durationMs) ? entry.durationMs : null,
+    aiDecision: entry.aiDecision || null,
+  };
+
+  telemetryState.calls.push(call);
+  if (telemetryState.calls.length > 200) {
+    telemetryState.calls.splice(0, telemetryState.calls.length - 200);
+  }
+
+  updateAdminLog();
+  return call.id;
+}
+
+function updateTelemetryEntry(callId, updates) {
+  if (!callId || !updates) {
+    return;
+  }
+
+  const entry = telemetryState.calls.find((call) => call.id === callId);
+  if (!entry) {
+    return;
+  }
+
+  Object.keys(updates).forEach((key) => {
+    if (Object.prototype.hasOwnProperty.call(updates, key)) {
+      entry[key] = updates[key];
+    }
+  });
+
+  updateAdminLog();
+}
+
+function escapeHtml(value) {
+  if (value == null) {
+    return '';
+  }
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function formatTimestamp(isoString) {
+  if (!isoString) {
+    return '—';
+  }
+  const date = new Date(isoString);
+  if (Number.isNaN(date.getTime())) {
+    return escapeHtml(isoString);
+  }
+  return date.toLocaleString(undefined, { hour12: false });
+}
+
+function formatTokensDisplay(tokens) {
+  if (!tokens) {
+    return '<span class="muted">–</span>';
+  }
+
+  const { input, output, total } = tokens;
+  const hasValues = [input, output, total].some((value) =>
+    Number.isFinite(value)
+  );
+
+  if (!hasValues) {
+    return '<span class="muted">–</span>';
+  }
+
+  const totalLabel = Number.isFinite(total)
+    ? total.toLocaleString()
+    : '—';
+
+  const detailParts = [];
+  if (Number.isFinite(input)) {
+    detailParts.push(`in ${input.toLocaleString()}`);
+  }
+  if (Number.isFinite(output)) {
+    detailParts.push(`out ${output.toLocaleString()}`);
+  }
+
+  const detailText = detailParts.length
+    ? detailParts.join(' · ')
+    : 'tokens';
+
+  return `<div class="token-metric"><strong>${totalLabel}</strong><span>${escapeHtml(
+    detailText
+  )}</span></div>`;
+}
+
+function updateAdminLog() {
+  const summaryEl = document.getElementById('admin-summary');
+  const tableBody = document.getElementById('admin-table-body');
+
+  if (!summaryEl || !tableBody) {
+    return;
+  }
+
+  if (!telemetryState.calls.length) {
+    summaryEl.textContent = 'No OpenAI activity recorded yet.';
+    tableBody.innerHTML =
+      '<tr class="empty-row"><td colspan="6">No calls yet.</td></tr>';
+    return;
+  }
+
+  const totals = telemetryState.calls.reduce(
+    (acc, call) => {
+      if (call.status === 'success') {
+        acc.success += 1;
+      } else if (call.status === 'error') {
+        acc.error += 1;
+      }
+
+      if (call.tokens) {
+        const { input, output, total } = call.tokens;
+        if (Number.isFinite(input)) {
+          acc.input += input;
+        }
+        if (Number.isFinite(output)) {
+          acc.output += output;
+        }
+        if (Number.isFinite(total)) {
+          acc.total += total;
+        } else {
+          if (Number.isFinite(input)) {
+            acc.total += input;
+          }
+          if (Number.isFinite(output)) {
+            acc.total += output;
+          }
+        }
+      }
+
+      return acc;
+    },
+    { success: 0, error: 0, input: 0, output: 0, total: 0 }
+  );
+
+  const totalTokensLabel = totals.total
+    ? `${totals.total.toLocaleString()} tokens`
+    : '0 tokens';
+
+  summaryEl.innerHTML = `
+    <strong>${telemetryState.calls.length}</strong> call${
+    telemetryState.calls.length === 1 ? '' : 's'
+  }
+    • <span>${totals.success} succeeded</span>
+    • <span>${totals.error} failed</span>
+    • <span>${escapeHtml(totalTokensLabel)}</span>
+  `.trim();
+
+  const rows = telemetryState.calls
+    .slice()
+    .reverse()
+    .map((call) => {
+      const endpointLabel =
+        call.type === 'embeddings'
+          ? 'Embeddings'
+          : call.type === 'responses'
+          ? 'Responses'
+          : escapeHtml(call.type);
+
+      const contextParts = [];
+      if (call.questionNumber) {
+        contextParts.push(`Q${escapeHtml(call.questionNumber)}`);
+      }
+      if (call.description) {
+        contextParts.push(escapeHtml(call.description));
+      } else if (call.questionText) {
+        contextParts.push(escapeHtml(call.questionText));
+      }
+
+      const metaParts = [];
+      if (call.contextCount) {
+        metaParts.push(
+          `${call.contextCount} excerpt${call.contextCount === 1 ? '' : 's'}`
+        );
+      }
+      if (call.payloadSize) {
+        metaParts.push(`${call.payloadSize.toLocaleString()} chars`);
+      }
+
+      const contextText = [
+        contextParts.join(' • '),
+        metaParts.length ? `(${metaParts.join(', ')})` : '',
+      ]
+        .filter(Boolean)
+        .join(' ');
+
+      const statusClass =
+        call.status === 'success'
+          ? 'status-success'
+          : call.status === 'error'
+          ? 'status-error'
+          : 'status-pending';
+      const statusLabel =
+        call.status === 'success'
+          ? 'Success'
+          : call.status === 'error'
+          ? 'Error'
+          : 'Pending';
+
+      const statusMeta = [];
+      if (call.httpStatus) {
+        statusMeta.push(`HTTP ${call.httpStatus}`);
+      }
+      if (Number.isFinite(call.durationMs)) {
+        statusMeta.push(`${call.durationMs} ms`);
+      }
+
+      const statusExtra = statusMeta.length
+        ? `<span class="status-extra">${escapeHtml(
+            statusMeta.join(' · ')
+          )}</span>`
+        : '';
+
+      const detailParts = [];
+      if (call.status === 'error' && call.errorMessage) {
+        detailParts.push(call.errorMessage);
+      }
+      if (call.aiDecision) {
+        const answerValue = call.aiDecision.answerValue;
+        const answerLabelText = call.aiDecision.answerLabel;
+        let answerSummary = 'No answer';
+        if (answerValue) {
+          answerSummary = `Answer ${answerValue}`;
+          if (answerLabelText) {
+            answerSummary += ` • ${answerLabelText}`;
+          }
+        }
+        detailParts.push(answerSummary);
+        if (call.aiDecision.reason) {
+          detailParts.push(call.aiDecision.reason);
+        }
+      } else if (call.responsePreview) {
+        detailParts.push(call.responsePreview);
+      }
+
+      const detailText = detailParts
+        .filter(Boolean)
+        .map((part) => escapeHtml(part))
+        .join('\n');
+
+      return `
+        <tr>
+          <td>${formatTimestamp(call.timestamp)}</td>
+          <td>${endpointLabel}</td>
+          <td>${contextText ? contextText : '<span class="muted">—</span>'}</td>
+          <td>
+            <span class="status-pill ${statusClass}">${statusLabel}</span>
+            ${statusExtra}
+          </td>
+          <td>${formatTokensDisplay(call.tokens)}</td>
+          <td><span class="details-text">${
+            detailText || '<span class="muted">—</span>'
+          }</span></td>
+        </tr>
+      `;
+    })
+    .join('');
+
+  tableBody.innerHTML = rows;
+}
+
+function switchAppView(target) {
+  if (!target || viewState.active === target) {
+    return;
+  }
+
+  const sections = document.querySelectorAll('.app-view');
+  sections.forEach((section) => {
+    const isActive = section.dataset.view === target;
+    section.hidden = !isActive;
+    section.classList.toggle('active', isActive);
+  });
+
+  const buttons = document.querySelectorAll('[data-view-target]');
+  buttons.forEach((button) => {
+    const isActive = button.dataset.viewTarget === target;
+    button.classList.toggle('active', isActive);
+    button.setAttribute('aria-pressed', isActive ? 'true' : 'false');
+  });
+
+  viewState.active = target;
+}
+
+function setupViewNavigation() {
+  const buttons = document.querySelectorAll('[data-view-target]');
+  buttons.forEach((button) => {
+    button.addEventListener('click', () => {
+      const view = button.dataset.viewTarget;
+      switchAppView(view);
+    });
+  });
+}
+
+async function performOpenAiCall({ endpoint, payload, apiKey, meta = {} }) {
+  const callId = meta.id || generateTelemetryId();
+  const startTime =
+    typeof performance !== 'undefined' && performance.now
+      ? performance.now()
+      : Date.now();
+  const timestamp = new Date().toISOString();
+  const requestBody = JSON.stringify(payload);
+  let response;
+  let responseData = null;
+  let logged = false;
+
+  const baseLog = {
+    id: callId,
+    timestamp,
+    type: meta.type || 'openai',
+    subtype: meta.subtype || '',
+    description: meta.description || '',
+    questionNumber: meta.questionNumber || '',
+    questionText: meta.questionText || '',
+    contextCount: Array.isArray(meta.contextChunks)
+      ? meta.contextChunks.length
+      : Number.isFinite(meta.contextCount)
+      ? meta.contextCount
+      : 0,
+    payloadSize: requestBody.length,
+  };
+
+  const logCall = (fields) => {
+    logged = true;
+    recordOpenAiCall({
+      ...baseLog,
+      durationMs: Math.round(
+        (typeof performance !== 'undefined' && performance.now
+          ? performance.now()
+          : Date.now()) - startTime
+      ),
+      ...fields,
+    });
+  };
+
+  try {
+    response = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: requestBody,
+    });
+
+    const responseText = await response.text();
+    if (responseText) {
+      try {
+        responseData = JSON.parse(responseText);
+      } catch (parseError) {
+        responseData = null;
+      }
+    }
+
+    const tokens = normalizeUsage(responseData?.usage);
+
+    if (!response.ok) {
+      const errorMessage =
+        responseData?.error?.message ||
+        `Request failed with status ${response.status}`;
+      logCall({
+        status: 'error',
+        httpStatus: response.status,
+        tokens,
+        responsePreview: responseData?.error?.message || '',
+        errorMessage,
+      });
+      throw new Error(errorMessage);
+    }
+
+    const preview = meta.previewExtractor
+      ? meta.previewExtractor(responseData) || ''
+      : '';
+
+    logCall({
+      status: 'success',
+      httpStatus: response.status,
+      tokens,
+      responsePreview: preview,
+    });
+
+    return { data: responseData, callId };
+  } catch (error) {
+    if (!logged) {
+      logCall({
+        status: 'error',
+        httpStatus: response ? response.status : null,
+        tokens: normalizeUsage(responseData?.usage),
+        responsePreview: '',
+        errorMessage: error.message || 'Request failed',
+      });
+    }
+    throw error;
+  }
+}
+
 const documentState = {
   name: '',
   size: 0,
   content: '',
   truncated: false,
+  chunks: [],
+  embeddings: [],
+  embeddingModel: '',
 };
 
 const questionnaireSections = [
@@ -704,6 +1164,206 @@ function normalizeDocumentText(text) {
   return lines.join('\n').trim();
 }
 
+function chunkDocumentContent(text, chunkSize = CHUNK_CHAR_LIMIT, overlap = CHUNK_CHAR_OVERLAP) {
+  if (!text) {
+    return [];
+  }
+
+  const sanitized = text.trim();
+  if (!sanitized) {
+    return [];
+  }
+
+  const chunks = [];
+  let start = 0;
+  let index = 0;
+
+  while (start < sanitized.length) {
+    let end = Math.min(sanitized.length, start + chunkSize);
+    let chunk = sanitized.slice(start, end);
+
+    if (end < sanitized.length) {
+      const lastBreak = chunk.lastIndexOf('\n');
+      if (lastBreak > chunkSize * 0.5) {
+        chunk = chunk.slice(0, lastBreak);
+        end = start + chunk.length;
+      }
+    }
+
+    const trimmedChunk = chunk.trim();
+    if (trimmedChunk) {
+      chunks.push({
+        id: `chunk-${index + 1}`,
+        text: trimmedChunk,
+        start,
+        end,
+      });
+      index += 1;
+    }
+
+    if (end >= sanitized.length) {
+      break;
+    }
+
+    start = Math.max(0, end - overlap);
+  }
+
+  return chunks;
+}
+
+async function embedTexts(texts, apiKey, meta = {}) {
+  if (!Array.isArray(texts) || texts.length === 0) {
+    return [];
+  }
+
+  const { data } = await performOpenAiCall({
+    endpoint: OPENAI_EMBEDDING_ENDPOINT,
+    apiKey,
+    payload: {
+      model: OPENAI_EMBEDDING_MODEL,
+      input: texts,
+    },
+    meta: {
+      type: 'embeddings',
+      subtype: meta.purpose || 'document',
+      description: meta.description || '',
+      questionNumber: meta.questionNumber || '',
+      questionText: meta.questionText || '',
+      contextCount: meta.contextCount ?? texts.length,
+    },
+  });
+
+  if (!data || !Array.isArray(data.data)) {
+    throw new Error('Embedding response was malformed.');
+  }
+
+  return data.data.map((item) => item.embedding || []);
+}
+
+function dotProduct(a, b) {
+  if (!a || !b || a.length !== b.length) {
+    return 0;
+  }
+  let total = 0;
+  for (let i = 0; i < a.length; i += 1) {
+    total += a[i] * b[i];
+  }
+  return total;
+}
+
+function vectorMagnitude(vector) {
+  if (!vector || vector.length === 0) {
+    return 0;
+  }
+  return Math.sqrt(dotProduct(vector, vector));
+}
+
+function cosineSimilarity(a, b) {
+  const denominator = vectorMagnitude(a) * vectorMagnitude(b);
+  if (denominator === 0) {
+    return 0;
+  }
+  return dotProduct(a, b) / denominator;
+}
+
+async function ensureDocumentEmbeddings(apiKey, statusEl) {
+  if (!documentState.content) {
+    throw new Error('No document available for indexing.');
+  }
+
+  if (!Array.isArray(documentState.chunks) || documentState.chunks.length === 0) {
+    documentState.chunks = chunkDocumentContent(documentState.content);
+  }
+
+  if (!documentState.chunks.length) {
+    throw new Error('The document did not yield any searchable chunks.');
+  }
+
+  if (
+    Array.isArray(documentState.embeddings) &&
+    documentState.embeddings.length === documentState.chunks.length &&
+    documentState.embeddingModel === OPENAI_EMBEDDING_MODEL
+  ) {
+    return;
+  }
+
+  if (statusEl) {
+    setAiStatus(statusEl, 'info', 'Indexing document for semantic search…');
+  }
+
+  const embeddings = [];
+  for (let i = 0; i < documentState.chunks.length; i += EMBEDDING_BATCH_SIZE) {
+    const batch = documentState.chunks.slice(i, i + EMBEDDING_BATCH_SIZE);
+    const rangeStart = i + 1;
+    const rangeEnd = Math.min(
+      i + EMBEDDING_BATCH_SIZE,
+      documentState.chunks.length
+    );
+    const batchEmbeddings = await embedTexts(
+      batch.map((chunk) => chunk.text),
+      apiKey,
+      {
+        purpose: 'document-index',
+        description: `Chunks ${rangeStart}-${rangeEnd}`,
+        contextCount: batch.length,
+      }
+    );
+    embeddings.push(...batchEmbeddings);
+  }
+
+  if (embeddings.length !== documentState.chunks.length) {
+    throw new Error('Mismatch between chunks and embeddings.');
+  }
+
+  documentState.embeddings = embeddings;
+  documentState.embeddingModel = OPENAI_EMBEDDING_MODEL;
+  updateDocumentPreview();
+}
+
+async function gatherContextForQuestion(question, apiKey, statusEl) {
+  await ensureDocumentEmbeddings(apiKey, statusEl);
+
+  if (!documentState.embeddings || documentState.embeddings.length === 0) {
+    return [];
+  }
+
+  if (statusEl) {
+    setAiStatus(statusEl, 'info', 'Searching document for relevant evidence…');
+  }
+
+  const queryText = `${question.number || 'Question'}: ${question.text}`;
+  const [questionEmbedding] = await embedTexts([queryText], apiKey, {
+    purpose: 'question-query',
+    description: 'Question embedding',
+    questionNumber: question.number || '',
+    questionText: question.text || '',
+    contextCount: 1,
+  });
+
+  if (!questionEmbedding || questionEmbedding.length === 0) {
+    return [];
+  }
+
+  const scored = documentState.embeddings.map((embedding, index) => ({
+    chunk: documentState.chunks[index],
+    score: cosineSimilarity(questionEmbedding, embedding),
+  }));
+
+  scored.sort((a, b) => b.score - a.score);
+
+  const relevant = scored
+    .slice(0, Math.min(MAX_CONTEXT_CHUNKS, scored.length))
+    .filter((item) => Number.isFinite(item.score) && item.score >= MIN_SIMILARITY_THRESHOLD)
+    .map((item, index) => ({
+      id: item.chunk.id,
+      text: item.chunk.text,
+      score: item.score,
+      order: index + 1,
+    }));
+
+  return relevant;
+}
+
 async function extractTextFromPdf(file) {
   const pdfjsLib = window.pdfjsLib;
   if (!pdfjsLib || typeof pdfjsLib.getDocument !== 'function') {
@@ -796,6 +1456,17 @@ function updateDocumentPreview(message) {
       parts.push(sizeLabel);
     }
     parts.push(`${charCount} characters analysed`);
+    if (Array.isArray(documentState.chunks) && documentState.chunks.length) {
+      parts.push(`${documentState.chunks.length} context chunks`);
+    }
+
+    if (
+      Array.isArray(documentState.embeddings) &&
+      documentState.embeddings.length === documentState.chunks.length &&
+      documentState.embeddingModel === OPENAI_EMBEDDING_MODEL
+    ) {
+      parts.push('Semantic index ready');
+    }
 
     let details = parts.join(' • ');
     if (documentState.truncated) {
@@ -821,6 +1492,9 @@ function clearDocument() {
   documentState.size = 0;
   documentState.content = '';
   documentState.truncated = false;
+  documentState.chunks = [];
+  documentState.embeddings = [];
+  documentState.embeddingModel = '';
 
   const uploadInput = document.getElementById('document-upload');
   if (uploadInput) {
@@ -856,6 +1530,9 @@ async function handleDocumentUpload(event) {
     documentState.size = file.size;
     documentState.content = usableText;
     documentState.truncated = truncated;
+    documentState.chunks = chunkDocumentContent(usableText);
+    documentState.embeddings = [];
+    documentState.embeddingModel = '';
 
     updateDocumentPreview();
   } catch (error) {
@@ -898,7 +1575,7 @@ function setAiStatus(element, variant, message) {
   element.textContent = message;
 }
 
-function buildAiPrompt(question) {
+function buildAiPrompt(question, contextChunks) {
   const optionsSummary = question.options
     .map((option) => `${option.value}: ${option.label}`)
     .join('\n');
@@ -906,6 +1583,18 @@ function buildAiPrompt(question) {
   const truncatedNote = documentState.truncated
     ? 'The document was truncated to fit the token limit. Base your decision only on the provided excerpt.'
     : '';
+
+  const evidenceBlock = Array.isArray(contextChunks) && contextChunks.length > 0
+    ? contextChunks
+        .map((chunk) => {
+          const similarityLabel =
+            typeof chunk.score === 'number' && Number.isFinite(chunk.score)
+              ? chunk.score.toFixed(2)
+              : 'n/a';
+          return `Excerpt ${chunk.order} (similarity ${similarityLabel}):\n${chunk.text}`;
+        })
+        .join('\n\n')
+    : 'No relevant excerpts were retrieved. If no evidence is provided, respond with canAnswer = false.';
 
   return `You are assisting with a corporate sustainability due diligence assessment. Based strictly on the provided document excerpt, decide whether the document contains enough information to answer the question.
 Return ONLY a compact JSON object with the following keys: "canAnswer" (boolean), "answerValue" (string or null), "answerLabel" (string), and "reason" (string).
@@ -921,9 +1610,8 @@ ${truncatedNote ? `Note: ${truncatedNote}\n` : ''}Question: ${
   }
 Answer options:\n${optionsSummary}
 
-<document>
-${documentState.content}
-</document>`;
+Evidence excerpts:
+${evidenceBlock}`;
 }
 
 function extractResponseText(responseData) {
@@ -1055,31 +1743,63 @@ async function handleAiAssist(question, context) {
     return;
   }
 
+  let responseCallId = null;
+  let rawResponseText = '';
+
   try {
     button.disabled = true;
     button.dataset.loading = 'true';
-    setAiStatus(statusEl, 'info', 'Consulting the AI assistant…');
 
-    const response = await fetch(OPENAI_ENDPOINT, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify({
+    const contextChunks = await gatherContextForQuestion(question, apiKey, statusEl);
+
+    const consultingMessage = contextChunks.length
+      ? 'Consulting the AI assistant…'
+      : 'Consulting the AI assistant (no strong matches found)…';
+    setAiStatus(statusEl, 'info', consultingMessage);
+
+    const { data, callId } = await performOpenAiCall({
+      endpoint: OPENAI_ENDPOINT,
+      apiKey,
+      payload: {
         model: OPENAI_MODEL,
-        input: buildAiPrompt(question),
+        input: buildAiPrompt(question, contextChunks),
         temperature: 0.2,
-      }),
+      },
+      meta: {
+        type: 'responses',
+        subtype: 'question-answer',
+        description: `Question ${question.number || ''}`.trim(),
+        questionNumber: question.number || '',
+        questionText: question.text || '',
+        contextChunks,
+        previewExtractor: (responseData) => {
+          const text = extractResponseText(responseData).trim();
+          return text.length > 400 ? `${text.slice(0, 400)}…` : text;
+        },
+      },
     });
 
-    if (!response.ok) {
-      throw new Error(`Request failed with status ${response.status}`);
-    }
+    responseCallId = callId;
 
-    const data = await response.json();
-    const responseText = extractResponseText(data).trim();
-    const aiResult = parseJsonFromText(responseText);
+    rawResponseText = extractResponseText(data).trim();
+    const aiResult = parseJsonFromText(rawResponseText);
+
+    const aiDecision = {
+      canAnswer: Boolean(aiResult.canAnswer),
+      answerValue: aiResult.answerValue || '',
+      answerLabel: aiResult.answerLabel || '',
+      reason: aiResult.reason || '',
+    };
+
+    const previewJson = JSON.stringify(aiResult, null, 2);
+    const trimmedPreview =
+      previewJson.length > 600 ? `${previewJson.slice(0, 600)}…` : previewJson;
+
+    updateTelemetryEntry(callId, {
+      responsePreview: trimmedPreview,
+      aiDecision,
+      errorMessage: '',
+    });
 
     if (aiResult.canAnswer && aiResult.answerValue) {
       const validOption = question.options.find(
@@ -1102,11 +1822,9 @@ async function handleAiAssist(question, context) {
     } else {
       resetAnswerSelect(answerSelect);
       setStatusValue(statusSelect, 'Open');
-      setAiStatus(
-        statusEl,
-        'info',
-        aiResult.reason || 'AI could not determine an answer from the document.'
-      );
+      const message =
+        aiResult.reason || 'AI could not determine an answer from the document.';
+      setAiStatus(statusEl, 'info', message);
     }
 
     if (aiResult.reason && reasoningTextarea) {
@@ -1121,6 +1839,17 @@ async function handleAiAssist(question, context) {
   } catch (error) {
     console.error('AI assistance failed', error);
     setAiStatus(statusEl, 'error', error.message || 'AI request failed.');
+    if (responseCallId) {
+      const updates = {
+        status: 'error',
+        errorMessage: error.message || 'AI request failed.',
+        aiDecision: null,
+      };
+      if (rawResponseText) {
+        updates.responsePreview = rawResponseText;
+      }
+      updateTelemetryEntry(responseCallId, updates);
+    }
   } finally {
     button.disabled = false;
     delete button.dataset.loading;
@@ -1360,6 +2089,9 @@ function updateMetrics() {
 
 function init() {
   setupControlPanel();
+  setupViewNavigation();
+  updateAdminLog();
+  switchAppView('questionnaire');
   const container = document.getElementById('questionnaire');
   questionnaireSections.forEach((section, index) => {
     container.appendChild(createSection(section, index));

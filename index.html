@@ -20,23 +20,48 @@
   <body>
     <div class="app-shell">
       <header class="app-header">
-        <div class="brand">
-          <span class="brand-mark">CSDDD</span>
-          <span class="brand-title">Questionnaire Companion</span>
-        </div>
-        <div class="metrics">
-          <div class="metric">
-            <span class="metric-label">Questions answered</span>
-            <span class="metric-value" id="answered-count">0 / 0</span>
+        <div class="header-main">
+          <div class="brand">
+            <span class="brand-mark">CSDDD</span>
+            <span class="brand-title">Questionnaire Companion</span>
           </div>
-          <div class="metric">
-            <span class="metric-label">Total score</span>
-            <span class="metric-value" id="score-total">0</span>
+          <div class="metrics">
+            <div class="metric">
+              <span class="metric-label">Questions answered</span>
+              <span class="metric-value" id="answered-count">0 / 0</span>
+            </div>
+            <div class="metric">
+              <span class="metric-label">Total score</span>
+              <span class="metric-value" id="score-total">0</span>
+            </div>
           </div>
         </div>
+        <nav class="view-nav" aria-label="App views">
+          <button
+            type="button"
+            class="view-tab active"
+            data-view-target="questionnaire"
+            aria-pressed="true"
+          >
+            Questionnaire
+          </button>
+          <button
+            type="button"
+            class="view-tab"
+            data-view-target="admin"
+            aria-pressed="false"
+          >
+            Admin Console
+          </button>
+        </nav>
       </header>
-      <main>
-        <section class="control-panel">
+      <main class="app-main">
+        <section
+          id="questionnaire-view"
+          class="app-view active"
+          data-view="questionnaire"
+        >
+          <section class="control-panel">
           <div class="control-panel-header">
             <h2>Document &amp; AI Assistant</h2>
             <p class="control-panel-subtitle">
@@ -73,8 +98,39 @@
           <p class="control-panel-hint">
             The uploaded document never leaves your browser until you request AI assistance for a specific question.
           </p>
+          </section>
+          <section id="questionnaire"></section>
         </section>
-        <section id="questionnaire"></section>
+        <section id="admin-view" class="app-view" data-view="admin" hidden>
+          <section class="admin-panel">
+            <div class="admin-panel-header">
+              <h2>AI Activity Monitor</h2>
+              <p>Review OpenAI requests, responses, and token consumption for this session.</p>
+            </div>
+            <div class="admin-summary" id="admin-summary">
+              No OpenAI activity recorded yet.
+            </div>
+            <div class="admin-table-wrapper">
+              <table class="admin-table" aria-live="polite">
+                <thead>
+                  <tr>
+                    <th scope="col">Timestamp</th>
+                    <th scope="col">Endpoint</th>
+                    <th scope="col">Context</th>
+                    <th scope="col">Status</th>
+                    <th scope="col">Tokens</th>
+                    <th scope="col">Details</th>
+                  </tr>
+                </thead>
+                <tbody id="admin-table-body">
+                  <tr class="empty-row">
+                    <td colspan="6">No calls yet.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </section>
+        </section>
       </main>
     </div>
     <script src="app.js" defer></script>
